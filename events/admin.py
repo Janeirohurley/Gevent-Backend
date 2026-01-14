@@ -35,14 +35,14 @@ class TicketAdmin(admin.ModelAdmin):
     list_display = ['code', 'event', 'user', 'status', 'purchase_date']
     list_filter = ['status', 'purchase_date']
     search_fields = ['code', 'user__username', 'event__title']
-    readonly_fields = ['code', 'qr_code']
+    readonly_fields = ['code', 'qr_code', 'tva_amount', 'price_ttc']
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ['order_number', 'user', 'event', 'total_amount', 'payment_status']
+    list_display = ['order_number', 'user', 'event', 'total_ttc', 'payment_status']
     list_filter = ['payment_status', 'created_at']
     search_fields = ['order_number', 'user__username', 'event__title']
-    readonly_fields = ['order_number']
+    readonly_fields = ['order_number', 'total_ht', 'total_tva', 'total_ttc']
 
 @admin.register(Review)
 class ReviewAdmin(admin.ModelAdmin):

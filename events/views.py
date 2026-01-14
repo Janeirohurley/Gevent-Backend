@@ -1,6 +1,7 @@
 from rest_framework import viewsets, filters, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters.rest_framework import DjangoFilterBackend
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -16,6 +17,7 @@ User = get_user_model()
 class EventViewSet(viewsets.ModelViewSet):
     queryset = Event.objects.all()
     serializer_class = EventSerializer
+    parser_classes = [MultiPartParser, FormParser]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['category', 'status', 'is_free', 'is_popular']
     search_fields = ['title', 'description', 'location']
@@ -73,6 +75,48 @@ class EventViewSet(viewsets.ModelViewSet):
         except Attendee.DoesNotExist:
             return Response({'message': 'Vous ne participez pas à cet événement'}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=False, methods=['get'])
+    def my_events(self, request):
+        """Événements organisés par l'utilisateur connecté"""
+        my_events = self.queryset.filter(organizer=request.user)
+        serializer = self.get_serializer(my_events, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def upload_image(self, request, pk=None):
+        """Upload multiple images for an event"""
+        event = self.get_object()
+        
+        # Vérifier que l'utilisateur est l'organisateur
+        if event.organizer != request.user:
+            return Response({'error': 'Permission refusée'}, status=status.HTTP_403_FORBIDDEN)
+        
+        images = request.FILES.getlist('images')
+        if not images:
+            return Response({'error': 'Aucune image fournie'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        from .models import EventImage
+        uploaded_images = []
+        
+        for image in images:
+            event_image = EventImage.objects.create(
+                event=event,
+                image=image,
+                caption=request.data.get('caption', ''),
+                order=EventImage.objects.filter(event=event).count()
+            )
+            uploaded_images.append({
+                'id': event_image.id,
+                'image': event_image.image.url,
+                'caption': event_image.caption,
+                'order': event_image.order
+            })
+        
+        return Response({
+            'message': f'{len(uploaded_images)} image(s) uploadée(s) avec succès',
+            'images': uploaded_images
+        }, status=status.HTTP_201_CREATED)
+
 class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
@@ -125,7 +169,7 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
     
     @action(detail=False, methods=['post'])
     def validate_qr(self, request):
-        """Valider un QR code"""
+        """Valider un QR code - seuls les organisateurs peuvent valider leurs billets"""
         qr_data = request.data.get('qr_data')
         if not qr_data:
             return Response({'error': 'Données QR manquantes'}, status=status.HTTP_400_BAD_REQUEST)
@@ -133,7 +177,19 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
         ticket, message = Ticket.validate_qr_code(qr_data)
         
         if ticket:
+            # Vérifier que l'utilisateur est l'organisateur de l'événement
+            if ticket.event.organizer != request.user:
+                return Response({
+                    'valid': False,
+                    'message': 'Vous n\'êtes pas autorisé à valider ce billet'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
             serializer = self.get_serializer(ticket)
+            if ticket.status == 'confirmed':
+                ticket.status = 'used'
+                ticket.used_at = timezone.now()
+                ticket.save()
+            
             return Response({
                 'valid': True,
                 'message': message,
@@ -145,16 +201,7 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
                 'message': message
             }, status=status.HTTP_400_BAD_REQUEST)
     
-    @action(detail=True, methods=['post'])
-    def use_ticket(self, request, pk=None):
-        """Marquer un billet comme utilisé"""
-        ticket = self.get_object()
-        if ticket.status == 'confirmed':
-            ticket.status = 'used'
-            ticket.used_at = timezone.now()
-            ticket.save()
-            return Response({'message': 'Billet marqué comme utilisé'})
-        return Response({'message': 'Ce billet ne peut pas être utilisé'}, status=status.HTTP_400_BAD_REQUEST)
+
 
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
@@ -163,7 +210,12 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Order.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        """Créer une commande et générer automatiquement les billets si paiement immédiat"""
+        order = serializer.save(user=self.request.user)
+        
+        # Si le paiement est déjà complété lors de la création
+        if order.payment_status == 'completed':
+            order.create_tickets()
 
     @action(detail=True, methods=['put'])
     def payment(self, request, pk=None):
@@ -178,15 +230,8 @@ class OrderViewSet(viewsets.ModelViewSet):
                 order.transaction_id = transaction_id
             if payment_status == 'completed':
                 order.payment_date = timezone.now()
-                # Créer les billets
-                for i in range(order.quantity):
-                    Ticket.objects.create(
-                        event=order.event,
-                        user=order.user,
-                        holder_name=f"{order.user.first_name} {order.user.last_name}",
-                        holder_email=order.user.email,
-                        price=order.unit_price
-                    )
+                # Créer les billets via la méthode du modèle
+                order.create_tickets()
             order.save()
             return Response({'message': 'Paiement mis à jour'})
         return Response({'message': 'Statut de paiement invalide'}, status=status.HTTP_400_BAD_REQUEST)
@@ -214,8 +259,10 @@ class FavoriteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def toggle(self, request):
+        print(request.data)
         """Ajouter/retirer des favoris"""
         event_id = request.data.get('event_id')
+        print(request.data)
         try:
             event = Event.objects.get(id=event_id)
             favorite, created = Favorite.objects.get_or_create(

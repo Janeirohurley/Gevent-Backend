@@ -12,6 +12,7 @@ class User(AbstractUser):
     profile_image = models.ImageField(upload_to='profiles/', blank=True, null=True)
     bio = models.TextField(blank=True, null=True)
     date_of_birth = models.DateField(blank=True, null=True)
+    wallet_balance = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -49,6 +50,7 @@ class Event(models.Model):
         ('ongoing', 'En cours'),
         ('completed', 'Terminé'),
         ('cancelled', 'Annulé'),
+        ('deleted', 'Supprimé'),
     ]
 
     title = models.CharField(max_length=255)
@@ -73,8 +75,8 @@ class Event(models.Model):
     currency = models.CharField(max_length=3, default='BIF')  # Franc Burundais
 
     # Capacité et disponibilité
-    total_capacity = models.IntegerField(default=0)
-    available_seats = models.IntegerField(default=0)
+    total_capacity = models.IntegerField(default=100)
+    available_seats = models.IntegerField(blank=True, null=True)
 
     # Organisateur
     organizer = models.ForeignKey(User, on_delete=models.CASCADE, related_name='organized_events')
@@ -98,6 +100,12 @@ class Event(models.Model):
             models.Index(fields=['date', 'status']),
             models.Index(fields=['category', 'is_popular']),
         ]
+
+    def save(self, *args, **kwargs):
+        # Initialiser available_seats à total_capacity si non défini
+        if self.available_seats is None:
+            self.available_seats = self.total_capacity
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.title
@@ -368,19 +376,67 @@ class Order(models.Model):
         if self.payment_status != 'completed':
             return []
         
-        # Vérifier si les billets n'existent pas déjà
-        existing_tickets = Ticket.objects.filter(
-            user=self.user,
-            event=self.event,
-            purchase_date__date=self.created_at.date()
-        ).count()
+        from decimal import Decimal
         
-        if existing_tickets > 0:
-            return Ticket.objects.filter(
-                user=self.user,
-                event=self.event,
-                purchase_date__date=self.created_at.date()
+        # Vérifier le solde suffisant (même pour événements gratuits avec montant 0)
+        if self.user.wallet_balance < self.total_ttc:
+            raise ValueError(f"Solde insuffisant. Solde actuel: {self.user.wallet_balance} BIF, Montant requis: {self.total_ttc} BIF")
+        
+        # Déduire du wallet de l'acheteur
+        buyer_balance_before = self.user.wallet_balance
+        self.user.wallet_balance -= Decimal(str(self.total_ttc))
+        self.user.save()
+        
+        # Créer transaction d'achat pour l'acheteur
+        WalletTransaction.objects.create(
+            user=self.user,
+            transaction_type='purchase',
+            amount=-Decimal(str(self.total_ttc)),
+            balance_before=buyer_balance_before,
+            balance_after=self.user.wallet_balance,
+            description=f"Achat de {self.quantity} billet(s) pour {self.event.title}",
+            order=self
+        )
+        
+        # Pour chaque ticket: prix HT va à l'organisateur, TVA va à gcash
+        total_ht_for_organizer = Decimal(str(self.total_ht))
+        total_tva_for_gcash = Decimal(str(self.total_tva))
+        
+        # Transférer la TVA à l'app (compte gcash)
+        try:
+            gcash_user = User.objects.get(username='gcash')
+            gcash_balance_before = gcash_user.wallet_balance
+            gcash_user.wallet_balance += total_tva_for_gcash
+            gcash_user.save()
+            
+            WalletTransaction.objects.create(
+                user=gcash_user,
+                transaction_type='deposit',
+                amount=total_tva_for_gcash,
+                balance_before=gcash_balance_before,
+                balance_after=gcash_user.wallet_balance,
+                description=f"TVA collectée - {self.event.title} ({self.quantity} billets)",
+                order=self
             )
+        except User.DoesNotExist:
+            pass
+        
+        # Transférer le prix HT à l'organisateur
+        organizer = self.event.organizer
+        organizer_balance_before = organizer.wallet_balance
+        organizer.wallet_balance += total_ht_for_organizer
+        organizer.save()
+        
+        # Créer transaction de vente pour l'organisateur
+        WalletTransaction.objects.create(
+            user=organizer,
+            transaction_type='deposit',
+            amount=total_ht_for_organizer,
+            balance_before=organizer_balance_before,
+            balance_after=organizer.wallet_balance,
+            description=f"Vente de {self.quantity} billet(s) pour {self.event.title} à {self.user.username}",
+            order=self
+        )
         
         tickets = []
         for i in range(self.quantity):
@@ -402,6 +458,13 @@ class Order(models.Model):
         if self.event.available_seats >= self.quantity:
             self.event.available_seats -= self.quantity
             self.event.save()
+        
+        # Créer automatiquement un attendee
+        Attendee.objects.get_or_create(
+            event=self.event,
+            user=self.user,
+            defaults={'profile_image': self.user.profile_image}
+        )
         
         return tickets
 
@@ -443,3 +506,31 @@ class Favorite(models.Model):
 
     def __str__(self):
         return f"{self.user.username} - {self.event.title}"
+
+class WalletTransaction(models.Model):
+    """
+    Transactions du wallet
+    """
+    TRANSACTION_TYPES = [
+        ('deposit', 'Dépôt'),
+        ('purchase', 'Achat'),
+        ('refund', 'Remboursement'),
+        ('withdrawal', 'Retrait'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='wallet_transactions')
+    transaction_type = models.CharField(max_length=20, choices=TRANSACTION_TYPES)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    balance_before = models.DecimalField(max_digits=10, decimal_places=2)
+    balance_after = models.DecimalField(max_digits=10, decimal_places=2)
+    description = models.TextField()
+    order = models.ForeignKey(Order, on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
+    ticket = models.ForeignKey(Ticket, on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'wallet_transactions'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.transaction_type} - {self.amount} BIF"

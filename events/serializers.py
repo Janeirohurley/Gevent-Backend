@@ -1,15 +1,25 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from .models import Event, Category, Attendee, Ticket, Order, Review, Favorite, EventImage
+from .models import Event, Category, Attendee, Ticket, Order, Review, Favorite, EventImage, WalletTransaction
 
 User = get_user_model()
 
 class UserSerializer(serializers.ModelSerializer):
+    profile_image = serializers.SerializerMethodField()
+    
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'first_name', 'last_name', 
-                 'phone_number', 'profile_image', 'bio', 'date_of_birth']
+                 'phone_number', 'profile_image', 'bio', 'date_of_birth', 'wallet_balance', 'created_at']
         extra_kwargs = {'password': {'write_only': True}}
+    
+    def get_profile_image(self, obj):
+        if obj.profile_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.profile_image.url)
+            return obj.profile_image.url
+        return None
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -33,7 +43,8 @@ class EventSerializer(serializers.ModelSerializer):
     category_id = serializers.PrimaryKeyRelatedField(
         queryset=Category.objects.all(),
         source='category',
-        write_only=True
+        write_only=True,
+        required=False
     )
     attendees = AttendeeSerializer(many=True, read_only=True)
     attendee_count = serializers.SerializerMethodField()
@@ -41,6 +52,9 @@ class EventSerializer(serializers.ModelSerializer):
     is_favorited = serializers.SerializerMethodField()
     tva_amount = serializers.ReadOnlyField()
     price_with_tva = serializers.ReadOnlyField()
+    organizer_name = serializers.SerializerMethodField()
+    organizer_image = serializers.SerializerMethodField()
+    organizer_phone = serializers.SerializerMethodField()
     
     class Meta:
         model = Event
@@ -50,7 +64,7 @@ class EventSerializer(serializers.ModelSerializer):
             'date', 'end_date', 'duration',
             'is_free', 'price', 'tva_rate', 'tva_amount', 'price_with_tva', 'currency',
             'total_capacity', 'available_seats',
-            'organizer_name', 'organizer_image',
+            'organizer_name', 'organizer_image', 'organizer_phone',
             'status', 'is_popular', 'rating', 'total_reviews',
             'attendees', 'attendee_count', 'images', 'is_favorited',
             'created_at', 'updated_at'
@@ -65,6 +79,25 @@ class EventSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             return obj.favorited_by.filter(user=request.user).exists()
         return False
+    
+    def get_organizer_name(self, obj):
+        return f"{obj.organizer.first_name} {obj.organizer.last_name}" if obj.organizer.first_name else obj.organizer.username
+    
+    def get_organizer_image(self, obj):
+        if obj.organizer.profile_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.organizer.profile_image.url)
+            return obj.organizer.profile_image.url
+        return None
+    
+    def get_organizer_phone(self, obj):
+        phone = obj.organizer.phone_number
+        if phone:
+            if not phone.startswith('+'):
+                return f'+257{phone}'
+            return phone
+        return None
 
 class TicketSerializer(serializers.ModelSerializer):
     event = EventSerializer(read_only=True)
@@ -118,3 +151,9 @@ class FavoriteSerializer(serializers.ModelSerializer):
         model = Favorite
         fields = ['id', 'event', 'created_at']
         read_only_fields = ['created_at']
+
+class WalletTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WalletTransaction
+        fields = ['id', 'transaction_type', 'amount', 'balance_before', 'balance_after', 'description', 'created_at']
+        read_only_fields = ['balance_before', 'balance_after', 'created_at']

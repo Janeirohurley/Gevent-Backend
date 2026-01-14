@@ -1,9 +1,9 @@
 from django.contrib import admin
-from .models import User, Category, Event, EventImage, Attendee, Ticket, Order, Review, Favorite
+from .models import User, Category, Event, EventImage, Attendee, Ticket, Order, Review, Favorite, WalletTransaction
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ['username', 'email', 'first_name', 'last_name', 'created_at']
+    list_display = ['username', 'email', 'first_name', 'last_name', 'wallet_balance', 'created_at']
     list_filter = ['created_at', 'is_active']
     search_fields = ['username', 'email', 'first_name', 'last_name']
 
@@ -55,3 +55,10 @@ class FavoriteAdmin(admin.ModelAdmin):
     list_display = ['user', 'event', 'created_at']
     list_filter = ['created_at']
     search_fields = ['user__username', 'event__title']
+
+@admin.register(WalletTransaction)
+class WalletTransactionAdmin(admin.ModelAdmin):
+    list_display = ['user', 'transaction_type', 'amount', 'balance_after', 'created_at']
+    list_filter = ['transaction_type', 'created_at']
+    search_fields = ['user__username', 'description']
+    readonly_fields = ['balance_before', 'balance_after', 'created_at']

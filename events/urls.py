@@ -10,6 +10,7 @@ router.register(r'tickets', views.TicketViewSet, basename='ticket')
 router.register(r'orders', views.OrderViewSet, basename='order')
 router.register(r'reviews', views.ReviewViewSet, basename='review')
 router.register(r'favorites', views.FavoriteViewSet, basename='favorite')
+router.register(r'wallet', views.WalletViewSet, basename='wallet')
 
 urlpatterns = [
     # Authentification (APIView)

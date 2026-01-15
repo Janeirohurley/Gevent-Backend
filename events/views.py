@@ -5,6 +5,7 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django_filters.rest_framework import DjangoFilterBackend
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from django.db import models
 from .models import Event, Category, Attendee, Ticket, Order, Review, Favorite, WalletTransaction
 from .serializers import (
     EventSerializer, CategorySerializer, AttendeeSerializer,
@@ -19,29 +20,85 @@ class EventViewSet(viewsets.ModelViewSet):
     serializer_class = EventSerializer
     parser_classes = [JSONParser, MultiPartParser, FormParser]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['category', 'status', 'is_free', 'is_popular']
+    filterset_fields = ['status', 'is_free', 'is_popular']
     search_fields = ['title', 'description', 'location']
     ordering_fields = ['date', 'price', 'rating', 'created_at']
     ordering = ['-date']
+
+    def get_queryset(self):
+        """Recommandations basées sur les catégories des favoris et tickets achetés"""
+        queryset = super().get_queryset()
+        category = self.request.query_params.get('category')
+        
+        # Si action est list (recommandations)
+        if self.action == 'list':
+            # Récupérer les catégories des favoris de l'utilisateur
+            favorite_categories = Favorite.objects.filter(
+                user=self.request.user
+            ).values_list('event__category', flat=True).distinct()
+            
+            # Récupérer les catégories des tickets achetés
+            ticket_categories = Ticket.objects.filter(
+                user=self.request.user
+            ).values_list('event__category', flat=True).distinct()
+            
+            # Combiner les catégories
+            user_categories = set(list(favorite_categories) + list(ticket_categories))
+            
+            if user_categories:
+                # Recommander des événements dans ces catégories
+                queryset = queryset.filter(category__id__in=user_categories)
+            
+        if category:
+            queryset = queryset.filter(category__name=category)
+        return queryset
 
     def perform_create(self, serializer):
         serializer.save(organizer=self.request.user)
 
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
-        """Événements à venir"""
-        upcoming_events = self.queryset.filter(
-            status='upcoming',
-            date__gte=timezone.now()
-        ).order_by('date')
-        serializer = self.get_serializer(upcoming_events, many=True)
+        """Événements à venir - status upcoming ET date future"""
+        queryset = self.queryset.filter(status='upcoming', date__gte=timezone.now())
+        
+        category = request.query_params.get('category')
+        search = request.query_params.get('search')
+        
+        if category:
+            queryset = queryset.filter(category__name=category)
+        if search:
+            queryset = queryset.filter(
+                models.Q(title__icontains=search) |
+                models.Q(description__icontains=search) |
+                models.Q(location__icontains=search)
+            )
+        
+        queryset = queryset.order_by('date')
+        serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def popular(self, request):
-        """Événements populaires"""
-        popular_events = self.queryset.filter(is_popular=True)
-        serializer = self.get_serializer(popular_events, many=True)
+        """Événements populaires - basé sur le nombre de tickets vendus"""
+        from django.db.models import Count
+        
+        queryset = self.queryset.annotate(
+            tickets_sold=Count('tickets', filter=models.Q(tickets__status='confirmed'))
+        ).filter(tickets_sold__gt=0).order_by('-tickets_sold')
+        
+        category = request.query_params.get('category')
+        search = request.query_params.get('search')
+        
+        if category:
+            queryset = queryset.filter(category__name=category)
+        if search:
+            queryset = queryset.filter(
+                models.Q(title__icontains=search) |
+                models.Q(description__icontains=search) |
+                models.Q(location__icontains=search)
+            )
+        
+        serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=['get'])

@@ -20,6 +20,50 @@ class User(AbstractUser):
         db_table = 'users'
         ordering = ['-created_at']
 
+    def save(self, *args, **kwargs):
+        # Générer une image par défaut si aucune image n'est fournie
+        if not self.profile_image and self.first_name and self.last_name:
+            self.profile_image = self.generate_default_avatar()
+        super().save(*args, **kwargs)
+    
+    def generate_default_avatar(self):
+        """Génère un avatar par défaut basé sur les initiales"""
+        from PIL import Image, ImageDraw, ImageFont
+        import os
+        from django.core.files.base import ContentFile
+        from io import BytesIO
+        
+        # Créer les initiales
+        initials = f"{self.first_name[0]}{self.last_name[0]}".upper()
+        
+        # Créer une image 200x200
+        img = Image.new('RGB', (200, 200), color='#007bff')
+        draw = ImageDraw.Draw(img)
+        
+        # Dessiner les initiales au centre
+        try:
+            font = ImageFont.truetype('arial.ttf', 80)
+        except:
+            font = ImageFont.load_default()
+        
+        bbox = draw.textbbox((0, 0), initials, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        x = (200 - text_width) // 2
+        y = (200 - text_height) // 2
+        
+        draw.text((x, y), initials, fill='white', font=font)
+        
+        # Sauvegarder en mémoire
+        buffer = BytesIO()
+        img.save(buffer, format='PNG')
+        buffer.seek(0)
+        
+        # Retourner le fichier
+        filename = f"default_avatar_{self.username}.png"
+        return ContentFile(buffer.getvalue(), name=filename)
+
     def __str__(self):
         return self.username
     
@@ -39,6 +83,51 @@ class Category(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class TicketCategory(models.Model):
+    """
+    Catégories de tickets pour un événement (VIP, VVIP, Basique, etc.)
+    """
+    event = models.ForeignKey('Event', on_delete=models.CASCADE, related_name='ticket_categories')
+    name = models.CharField(max_length=100)  # VIP, VVIP, Basique, etc.
+    description = models.TextField(blank=True, null=True)
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    capacity = models.IntegerField(default=50)  # Nombre de places pour cette catégorie
+    available_seats = models.IntegerField(blank=True, null=True)
+    color = models.CharField(max_length=7, default='#007bff')  # Couleur hex pour l'UI
+    benefits = models.TextField(blank=True, null=True)  # Avantages de cette catégorie
+    order = models.IntegerField(default=0)  # Ordre d'affichage
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ticket_categories'
+        unique_together = ['event', 'name']
+        ordering = ['order', 'price']
+
+    def save(self, *args, **kwargs):
+        if self.available_seats is None:
+            self.available_seats = self.capacity
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.event.title} - {self.name} ({self.price} BIF)"
+
+    @property
+    def is_sold_out(self):
+        return self.available_seats <= 0
+
+    @property
+    def tva_amount(self):
+        """Calcule le montant de la TVA"""
+        from decimal import Decimal
+        return (Decimal(str(self.price)) * Decimal('10.00')) / Decimal('100')
+    
+    @property
+    def price_with_tva(self):
+        """Calcule le prix TTC (avec TVA)"""
+        from decimal import Decimal
+        return Decimal(str(self.price)) + Decimal(str(self.tva_amount))
 
 
 class Event(models.Model):
@@ -85,6 +174,7 @@ class Event(models.Model):
 
     # Statut et métriques
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='upcoming')
+    is_approved = models.BooleanField(default=False)
     is_popular = models.BooleanField(default=False)
     rating = models.DecimalField(max_digits=3, decimal_places=2, default=0.00)
     total_reviews = models.IntegerField(default=0)
@@ -165,6 +255,23 @@ class Attendee(models.Model):
     def __str__(self):
         return f"{self.user.username} - {self.event.title}"
     
+    @property
+    def tickets_info(self):
+        """Retourne les informations des tickets achetés par cet attendee"""
+        tickets = self.user.tickets.filter(event=self.event, status='confirmed')
+        return [{
+            'category': ticket.ticket_category.name,
+            'price_paid': str(ticket.price_ttc),
+            'quantity': 1
+        } for ticket in tickets]
+    
+    @property
+    def total_paid(self):
+        """Montant total payé par cet attendee pour cet événement"""
+        from decimal import Decimal
+        tickets = self.user.tickets.filter(event=self.event, status='confirmed')
+        return sum(Decimal(str(ticket.price_ttc)) for ticket in tickets)
+    
 class Ticket(models.Model):
     """
     Billets achetés par les utilisateurs
@@ -178,6 +285,7 @@ class Ticket(models.Model):
 
     code = models.CharField(max_length=50, unique=True)
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='tickets')
+    ticket_category = models.ForeignKey(TicketCategory, on_delete=models.CASCADE, related_name='tickets')
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='tickets')
 
     # Informations du détenteur
@@ -243,6 +351,8 @@ class Ticket(models.Model):
         qr_data = {
             'ticket_code': self.code,
             'event_title': self.event.title,
+            'ticket_category': self.ticket_category.name,
+            'category_color': self.ticket_category.color,
             'holder_name': self.holder_name,
             'event_date': self.event.date.isoformat() if self.event else None,
             'seat': self.seat or 'General',
@@ -318,11 +428,12 @@ class Order(models.Model):
         ('completed', 'Complété'),
         ('failed', 'Échoué'),
         ('refunded', 'Remboursé'),
-    ]
+    ]   
 
     order_number = models.CharField(max_length=50, unique=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='orders')
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='orders')
+    ticket_category = models.ForeignKey(TicketCategory, on_delete=models.CASCADE, related_name='orders')
 
     # Informations de paiement
     quantity = models.IntegerField(default=1)
@@ -364,8 +475,8 @@ class Order(models.Model):
         # Calculer automatiquement les totaux
         if self.quantity:
             from decimal import Decimal
-            self.unit_price= Decimal(str(self.event.price)) if self.event else Decimal('0')
-            self.total_ht = self.unit_price* Decimal(str(self.quantity))
+            self.unit_price = Decimal(str(self.ticket_category.price)) if self.ticket_category else Decimal('0')
+            self.total_ht = self.unit_price * Decimal(str(self.quantity))
             self.total_tva = (self.total_ht * Decimal(str(self.tva_rate))) / Decimal('100')
             self.total_ttc = self.total_ht + self.total_tva
         
@@ -394,7 +505,7 @@ class Order(models.Model):
             amount=-Decimal(str(self.total_ttc)),
             balance_before=buyer_balance_before,
             balance_after=self.user.wallet_balance,
-            description=f"Achat de {self.quantity} billet(s) pour {self.event.title}",
+            description=f"Achat de {self.quantity} billet(s) {self.ticket_category.name} pour {self.event.title}",
             order=self
         )
         
@@ -434,16 +545,24 @@ class Order(models.Model):
             amount=total_ht_for_organizer,
             balance_before=organizer_balance_before,
             balance_after=organizer.wallet_balance,
-            description=f"Vente de {self.quantity} billet(s) pour {self.event.title} à {self.user.username}",
+            description=f"Vente de {self.quantity} billet(s) {self.ticket_category.name} pour {self.event.title} à {self.user.username}",
             order=self
         )
         
+        # Calculer le nombre de tickets déjà vendus pour cette catégorie
+        existing_tickets_count = Ticket.objects.filter(
+            event=self.event,
+            ticket_category=self.ticket_category,
+            status='confirmed'
+        ).count()
+        
         tickets = []
         for i in range(self.quantity):
-            seat_number = f"A{i+1}" if self.event.total_capacity > 0 else "General"
+            seat_number = f"{self.ticket_category.name[0]}{existing_tickets_count + i + 1}" if self.ticket_category.capacity > 0 else "General"
             
             ticket = Ticket.objects.create(
                 event=self.event,
+                ticket_category=self.ticket_category,
                 user=self.user,
                 holder_name=f"{self.user.first_name} {self.user.last_name}",
                 holder_email=self.user.email,
@@ -454,7 +573,12 @@ class Order(models.Model):
             )
             tickets.append(ticket)
         
-        # Mettre à jour les sièges disponibles
+        # Mettre à jour les sièges disponibles de la catégorie ET de l'événement
+        if self.ticket_category.available_seats >= self.quantity:
+            self.ticket_category.available_seats -= self.quantity
+            self.ticket_category.save()
+        
+        # Mettre à jour les sièges disponibles de l'événement
         if self.event.available_seats >= self.quantity:
             self.event.available_seats -= self.quantity
             self.event.save()

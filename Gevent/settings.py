@@ -141,6 +141,10 @@ CORS_ALLOW_ALL_ORIGINS = True  # Pour le développement
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://a92096d351a9.ngrok-free.app"
+]
+CSRF_TRUSTED_ORIGINS = [
+    "https://a92096d351a9.ngrok-free.app",
 ]
 
 # REST Framework settings

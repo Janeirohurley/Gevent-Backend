@@ -6,11 +6,11 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from django.db import models
-from .models import Event, Category, Attendee, Ticket, Order, Review, Favorite, WalletTransaction
+from .models import Event, Category, Attendee, Ticket, Order, Review, Favorite, WalletTransaction, TicketCategory
 from .serializers import (
     EventSerializer, CategorySerializer, AttendeeSerializer,
     TicketSerializer, OrderSerializer, ReviewSerializer,
-    FavoriteSerializer, UserSerializer, WalletTransactionSerializer
+    FavoriteSerializer, UserSerializer, WalletTransactionSerializer, TicketCategorySerializer
 )
 
 User = get_user_model()
@@ -27,7 +27,19 @@ class EventViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Recommandations basées sur les catégories des favoris et tickets achetés"""
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().prefetch_related('ticket_categories')
+        
+        # Pour les actions d'organisateur (my_events, soft_delete, etc.), ne pas filtrer par approbation
+        if self.action in ['soft_delete', 'cancel_event', 'change_status', 'upload_image', 'add_ticket_category']:
+            return queryset
+        
+        # Exclure les événements annulés et supprimés pour tous les utilisateurs
+        queryset = queryset.exclude(status__in=['cancelled', 'deleted'])
+        
+        # Filtrer les événements approuvés pour les utilisateurs normaux
+        if not self.request.user.is_staff:
+            queryset = queryset.filter(is_approved=True)
+        
         category = self.request.query_params.get('category')
         
         # Si action est list (recommandations)
@@ -58,8 +70,15 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
-        """Événements à venir - status upcoming ET date future"""
-        queryset = self.queryset.filter(status='upcoming', date__gte=timezone.now())
+        """Événements à venir - status upcoming ET date future ET non annulés"""
+        queryset = self.queryset.filter(
+            status='upcoming', 
+            date__gte=timezone.now()
+        ).exclude(status__in=['cancelled', 'deleted'])
+        
+        # Filtrer les événements approuvés pour les utilisateurs normaux
+        if not request.user.is_staff:
+            queryset = queryset.filter(is_approved=True)
         
         category = request.query_params.get('category')
         search = request.query_params.get('search')
@@ -84,7 +103,11 @@ class EventViewSet(viewsets.ModelViewSet):
         
         queryset = self.queryset.annotate(
             tickets_sold=Count('tickets', filter=models.Q(tickets__status='confirmed'))
-        ).filter(tickets_sold__gt=0).order_by('-tickets_sold')
+        ).filter(tickets_sold__gt=0).exclude(status__in=['cancelled', 'deleted']).order_by('-tickets_sold')
+        
+        # Filtrer les événements approuvés pour les utilisateurs normaux
+        if not request.user.is_staff:
+            queryset = queryset.filter(is_approved=True)
         
         category = request.query_params.get('category')
         search = request.query_params.get('search')
@@ -238,7 +261,7 @@ class EventViewSet(viewsets.ModelViewSet):
             'total_refunded': str(total_refunded)
         })
     
-    @action(detail=True, methods=['delete'])
+    @action(detail=True, methods=['delete'], url_path='soft_delete')
     def soft_delete(self, request, pk=None):
         """Soft delete d'un événement (change le statut à deleted)"""
         event = self.get_object()
@@ -313,6 +336,107 @@ class EventViewSet(viewsets.ModelViewSet):
             'message': f'{len(uploaded_images)} image(s) uploadée(s) avec succès',
             'images': uploaded_images
         }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], permission_classes=[permissions.IsAdminUser])
+    def pending_approval(self, request):
+        """Événements en attente d'approbation - Admin seulement"""
+        queryset = self.queryset.filter(is_approved=False).exclude(status='deleted')
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAdminUser])
+    def approve(self, request, pk=None):
+        """Événements en attente d'approbation - Admin seulement"""
+        event = self.get_object()
+        event.is_approved = True
+        event.save()
+        
+        serializer = self.get_serializer(event)
+        return Response({
+            'message': f'Événement "{event.title}" approuvé avec succès',
+            'event': serializer.data
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAdminUser])
+    def reject(self, request, pk=None):
+        """Rejeter un événement - Admin seulement"""
+        event = self.get_object()
+        reason = request.data.get('reason', 'Aucune raison fournie')
+        
+        event.status = 'deleted'
+        event.save()
+        
+        return Response({
+            'message': f'Événement "{event.title}" rejeté',
+            'reason': reason
+        })
+
+    @action(detail=True, methods=['get'])
+    def ticket_categories(self, request, pk=None):
+        """Événements en attente d'approbation - Admin seulement"""
+        event = self.get_object()
+        categories = event.ticket_categories.all()
+        serializer = TicketCategorySerializer(categories, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def add_ticket_category(self, request, pk=None):
+        """Ajouter une catégorie de ticket - Organisateur seulement"""
+        event = self.get_object()
+        
+        if event.organizer != request.user:
+            return Response({'error': 'Permission refusée'}, status=status.HTTP_403_FORBIDDEN)
+        
+        serializer = TicketCategorySerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(event=event)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class TicketCategoryViewSet(viewsets.ModelViewSet):
+    queryset = TicketCategory.objects.all()
+    serializer_class = TicketCategorySerializer
+    
+    def get_queryset(self):
+        event_id = self.request.query_params.get('event')
+        if event_id:
+            return TicketCategory.objects.filter(event_id=event_id)
+        return TicketCategory.objects.all()
+    
+    def perform_create(self, serializer):
+        event_id = self.request.data.get('event_id')
+        try:
+            event = Event.objects.get(id=event_id, organizer=self.request.user)
+            serializer.save(event=event)
+        except Event.DoesNotExist:
+            raise serializers.ValidationError("Événement non trouvé ou permission refusée")
+    
+    def perform_update(self, serializer):
+        if serializer.instance.event.organizer != self.request.user:
+            raise serializers.ValidationError("Permission refusée")
+        serializer.save()
+    
+    def perform_destroy(self, instance):
+        if instance.event.organizer != self.request.user:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Permission refusée")
+        
+        # Vérifier qu'aucun ticket n'a été vendu pour cette catégorie
+        tickets_sold = Ticket.objects.filter(ticket_category=instance, status='confirmed').count()
+        if tickets_sold > 0:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError(f"Impossible de supprimer cette catégorie. {tickets_sold} billet(s) déjà vendu(s).")
+        
+        instance.delete()
+    
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except Exception as e:
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Category.objects.all()
@@ -406,9 +530,27 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
         ticket.cancelled_at = timezone.now()
         ticket.save()
         
-        # Libérer le siège
+        # Libérer les sièges dans la catégorie ET l'événement
+        ticket.ticket_category.available_seats += 1
+        ticket.ticket_category.save()
+        
         ticket.event.available_seats += 1
         ticket.event.save()
+        
+        # Vérifier si l'utilisateur a encore des tickets valides pour cet événement
+        remaining_tickets = Ticket.objects.filter(
+            user=ticket.user,
+            event=ticket.event,
+            status='confirmed'
+        ).count()
+        
+        # Si plus de tickets valides, supprimer de la liste des attendees
+        if remaining_tickets == 0:
+            try:
+                attendee = Attendee.objects.get(user=ticket.user, event=ticket.event)
+                attendee.delete()
+            except Attendee.DoesNotExist:
+                pass
         
         return Response({'message': f'Billet annulé - Remboursement de {refund_amount} BIF (45%)'})
     

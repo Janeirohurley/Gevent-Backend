@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import User, Category, Event, EventImage, Attendee, Ticket, Order, Review, Favorite, WalletTransaction
+from .models import User, Category, Event, EventImage, Attendee, Ticket, Order, Review, Favorite, WalletTransaction, TicketCategory
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
@@ -16,13 +16,35 @@ class EventImageInline(admin.TabularInline):
     model = EventImage
     extra = 1
 
+class TicketCategoryInline(admin.TabularInline):
+    model = TicketCategory
+    extra = 1
+    fields = ['name', 'price', 'capacity', 'color']
+
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
-    list_display = ['title', 'category', 'date', 'location', 'status', 'is_popular']
-    list_filter = ['category', 'status', 'is_popular', 'is_free', 'created_at']
+    list_display = ['title', 'category', 'date', 'location', 'status', 'is_popular', 'is_approved']
+    list_filter = ['category', 'status', 'is_popular', 'is_free', 'is_approved', 'created_at']
     search_fields = ['title', 'description', 'location']
-    inlines = [EventImageInline]
+    inlines = [EventImageInline, TicketCategoryInline]
     readonly_fields = ['rating', 'total_reviews']
+    actions = ['approve_events', 'reject_events']
+    
+    def approve_events(self, request, queryset):
+        queryset.update(is_approved=True)
+        self.message_user(request, f"{queryset.count()} événements approuvés.")
+    approve_events.short_description = "Approuver les événements sélectionnés"
+    
+    def reject_events(self, request, queryset):
+        queryset.update(is_approved=False)
+        self.message_user(request, f"{queryset.count()} événements rejetés.")
+    reject_events.short_description = "Rejeter les événements sélectionnés"
+
+@admin.register(TicketCategory)
+class TicketCategoryAdmin(admin.ModelAdmin):
+    list_display = ['name', 'event', 'price', 'capacity', 'color']
+    list_filter = ['event', 'price']
+    search_fields = ['name', 'event__title']
 
 @admin.register(Attendee)
 class AttendeeAdmin(admin.ModelAdmin):

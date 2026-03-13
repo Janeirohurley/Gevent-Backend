@@ -6,6 +6,7 @@ from . import auth_views
 router = DefaultRouter()
 router.register(r'events', views.EventViewSet)
 router.register(r'categories', views.CategoryViewSet)
+router.register(r'ticket-categories', views.TicketCategoryViewSet, basename='ticketcategory')
 router.register(r'tickets', views.TicketViewSet, basename='ticket')
 router.register(r'orders', views.OrderViewSet, basename='order')
 router.register(r'reviews', views.ReviewViewSet, basename='review')
